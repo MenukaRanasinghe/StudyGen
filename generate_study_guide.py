@@ -44,7 +44,7 @@ from docx.opc.constants import CONTENT_TYPE as CT
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")  # UI will not show it
 
-# Set to True if you want the course name + "Unit X - Summary" to appear at the top of page 2.
+# If False, the course name + "Unit X - Summary" will NOT be repeated at the top of page 2.
 INCLUDE_PAGE2_COURSE_HEADER = False
 
 
@@ -586,6 +586,90 @@ def replace_cover_footer_text(doc: Document, course_name: str, unit_no: str) -> 
             _replace_in_w_p(w_p, repl)
 
 
+
+# ----------------------------
+# Cover image replacement
+# ----------------------------
+
+def _load_image_bytes_converted(image_path: Path, target_content_type: str) -> bytes:
+    """
+    Load an image from disk and (if needed) convert it to match the template's image content type.
+    Supports JPEG and PNG. Uses Pillow if installed.
+    """
+    raw = image_path.read_bytes()
+
+    target = (target_content_type or "").lower().strip()
+    if target in ("image/jpg", "image/jpeg"):
+        target_fmt = "JPEG"
+    elif target == "image/png":
+        target_fmt = "PNG"
+    else:
+        # Unknown type; just return bytes as-is
+        return raw
+
+    # Quick header check: if already matches, return as-is
+    if target_fmt == "JPEG" and raw[:2] == b"\xff\xd8":
+        return raw
+    if target_fmt == "PNG" and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return raw
+
+    # Convert using Pillow if available
+    try:
+        from PIL import Image  # type: ignore
+        import io
+    except Exception:
+        raise SystemExit(
+            f"Cover image must be {target_fmt} to match the template.\n"
+            f"Either choose a {target_fmt} file, or install Pillow:\n"
+            f'  .venv\\Scripts\\python.exe -m pip install pillow'
+        )
+
+    with Image.open(image_path) as im:
+        # Ensure compatible mode
+        if target_fmt == "JPEG":
+            if im.mode in ("RGBA", "LA"):
+                # drop alpha
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+        elif target_fmt == "PNG":
+            if im.mode not in ("RGBA", "RGB"):
+                im = im.convert("RGBA")
+
+        out = io.BytesIO()
+        save_kwargs = {}
+        if target_fmt == "JPEG":
+            save_kwargs["quality"] = 95
+        im.save(out, format=target_fmt, **save_kwargs)
+        return out.getvalue()
+
+
+def replace_cover_image(doc: Document, cover_image_path: Path) -> None:
+    """
+    Replace the template cover image with the user-selected image.
+    Strategy: find the largest embedded image part in the DOCX package and replace its blob.
+    This preserves the layout (size/crop/position) from the template.
+    """
+    if not cover_image_path:
+        return
+    cover_image_path = Path(cover_image_path)
+    if not cover_image_path.exists():
+        raise SystemExit(f"Cover image not found: {cover_image_path}")
+
+    pkg = doc.part.package
+    img_parts = [p for p in pkg.parts if getattr(p, "content_type", "").startswith("image/")]
+    if not img_parts:
+        raise SystemExit("Template contains no embedded images to replace (cover image not found).")
+
+    # Pick the largest embedded image (usually the cover)
+    target_part = max(img_parts, key=lambda p: len(getattr(p, "blob", b"") or b""))
+    new_bytes = _load_image_bytes_converted(cover_image_path, getattr(target_part, "content_type", ""))
+
+    # Replace the image bytes
+    target_part._blob = new_bytes
+
 # ----------------------------
 # Study guide DOCX writer
 # ----------------------------
@@ -596,8 +680,13 @@ def write_study_guide_docx(
     course_name: str,
     unit_no: str,
     sg: StudyGuideJSON,
+    cover_image_path: Optional[Path] = None,
 ):
     doc = Document(str(template_path))
+
+    # Optional: replace the cover image in the template
+    if cover_image_path:
+        replace_cover_image(doc, cover_image_path)
 
     # Find prototypes BEFORE clearing content
     protos = find_template_prototypes(doc)
@@ -703,6 +792,7 @@ def run_generation(
     max_source_chars: int,
     retry_on_overlimit: bool,
     retry_on_invalid: bool,
+    cover_image: Optional[Path] = None,
     model: str = DEFAULT_MODEL,
 ):
     word_files = collect_word_files(inputs, template)
@@ -764,6 +854,7 @@ Return STRICT JSON ONLY.
         course_name=course_name,
         unit_no=unit_no,
         sg=sg,
+        cover_image_path=cover_image,
     )
 
     if out_pdf:
@@ -796,6 +887,8 @@ def run_gui():
     template_var = tk.StringVar(value=str(Path(__file__).with_name("Study Guide template.docx")))
     out_dir_var = tk.StringVar(value=str(Path(__file__).with_name("output")))
     base_name_var = tk.StringVar(value="StudyGuide")
+
+    cover_image_var = tk.StringVar()
 
     course_name_var = tk.StringVar()
     unit_no_var = tk.StringVar()
@@ -836,6 +929,14 @@ def run_gui():
         if d:
             out_dir_var.set(d)
 
+    def browse_cover_image():
+        f = filedialog.askopenfilename(
+            title="Select cover image (PNG/JPG)",
+            filetypes=[("Image files", "*.png;*.jpg;*.jpeg"), ("All files", "*.*")]
+        )
+        if f:
+            cover_image_var.set(f)
+
     # Layout
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
@@ -872,6 +973,10 @@ def run_gui():
 
     ttk.Label(inputs, text="Output name").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
     ttk.Entry(inputs, textvariable=base_name_var).grid(row=3, column=1, sticky="ew", pady=6)
+
+    ttk.Label(inputs, text="Cover image (optional)").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=6)
+    ttk.Entry(inputs, textvariable=cover_image_var).grid(row=4, column=1, sticky="ew", pady=6)
+    ttk.Button(inputs, text="Browse…", command=browse_cover_image).grid(row=4, column=2, padx=(8, 0), pady=6)
 
     # 2) Word settings
     settings = ttk.LabelFrame(main, text="2) Word settings", padding=12)
@@ -967,6 +1072,14 @@ def run_gui():
             messagebox.showerror("Missing input", "Please enter a numeric Unit no (e.g., 10).")
             return
 
+        # Cover image (optional)
+        cover_image_raw = cover_image_var.get().strip()
+        cover_image_path = Path(cover_image_raw) if cover_image_raw else None
+        if cover_image_path and not cover_image_path.exists():
+            messagebox.showerror("Missing input", f"Cover image not found: {cover_image_path}")
+            return
+
+
         out_docx = out_dir / f"{base}.docx"
         out_pdf = (out_dir / f"{base}.pdf") if make_pdf_var.get() else None
 
@@ -982,6 +1095,7 @@ def run_gui():
                     out_pdf=out_pdf,
                     course_name=course_name,
                     unit_no=unit_no,
+                    cover_image=cover_image_path,
                     word_limit_mode=word_limit_var.get(),
                     auto_threshold=int(auto_threshold_var.get()),
                     max_source_chars=int(max_source_chars_var.get()),
@@ -1024,6 +1138,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     # Back-compat (optional)
     ap.add_argument("--course-title", type=str, default="")
     ap.add_argument("--unit-title", type=str, default="")
+    ap.add_argument("--cover-image", type=Path, default=None, help="Optional cover image (PNG/JPG) to replace the template cover image.")
 
     ap.add_argument("--word-limit", choices=["auto", "750", "1000"], default="auto")
     ap.add_argument("--auto-threshold", type=int, default=3)
@@ -1067,6 +1182,7 @@ def main():
         out_pdf=args.out_pdf,
         course_name=course_name,
         unit_no=unit_no,
+        cover_image=args.cover_image,
         word_limit_mode=args.word_limit,
         auto_threshold=args.auto_threshold,
         max_source_chars=args.max_source_chars,
