@@ -44,6 +44,10 @@ from docx.opc.constants import CONTENT_TYPE as CT
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")  # UI will not show it
 
+# Set to True if you want the course name + "Unit X - Summary" to appear at the top of page 2.
+INCLUDE_PAGE2_COURSE_HEADER = False
+
+
 
 # ----------------------------
 # DOCX text extraction
@@ -604,16 +608,13 @@ def write_study_guide_docx(
 
     # Remove sample body (keep cover page shapes etc.)
     clear_body_from_first_content(doc)
-
-    # Top-of-content lines
-    if course_name.strip():
-        add_paragraph_from_proto(doc, protos.heading, course_name.strip())
-    if unit_no.strip():
-        add_paragraph_from_proto(doc, protos.heading, f"Unit {unit_no.strip()} - Summary")
-
-    # spacer
-    add_paragraph_from_proto(doc, protos.spacer, "")
-
+    # Optional: avoid repeating the cover-page title on page 2.
+    if INCLUDE_PAGE2_COURSE_HEADER:
+        if course_name.strip():
+            add_paragraph_from_proto(doc, protos.heading, course_name.strip())
+        if unit_no.strip():
+            add_paragraph_from_proto(doc, protos.heading, f"Unit {unit_no.strip()} - Summary")
+        add_paragraph_from_proto(doc, protos.spacer, "")
     # Section 1
     add_paragraph_from_proto(doc, protos.heading, sg.section1_heading)
     add_paragraph_from_proto(doc, protos.body, sg.section1_paragraph)
