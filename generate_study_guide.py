@@ -496,23 +496,64 @@ def _paragraph_text_nodes(w_p):
 
 def _replace_in_w_p(w_p, repl_func) -> bool:
     """
-    Replace in a single Word paragraph element (w:p) by rebuilding the full text across all w:t nodes.
+    Replace text inside a single Word paragraph element (w:p) while preserving layout-critical
+    elements such as tabs and fields.
+
+    Word footers/headers often lay out "left / center / right" content using w:tab and field codes
+    (e.g., page numbers). The previous implementation rebuilt the whole paragraph text from all w:t
+    nodes and then shoved it back into the first node, which can break tab stops and fields.
+
+    This version replaces text ONLY within contiguous groups of w:t nodes that are separated by
+    boundary elements (w:tab, field code markers, line breaks, etc.).
     """
-    t_nodes = _paragraph_text_nodes(w_p)
-    if not t_nodes:
-        return False
+    # Boundary tags inside a run that we should NOT cross when doing replacements
+    boundary_tags = {
+        qn("w:tab"),
+        qn("w:br"),
+        qn("w:cr"),
+        qn("w:fldChar"),
+        qn("w:instrText"),
+        qn("w:noBreakHyphen"),
+        qn("w:softHyphen"),
+    }
 
-    combined = "".join([(t.text or "") for t in t_nodes])
-    replaced = repl_func(combined)
+    changed = False
+    group = []
 
-    if replaced == combined:
-        return False
+    # Iterate runs in document order; inside each run, iterate children to detect boundaries.
+    runs = w_p.xpath(".//w:r")
+    for r in runs:
+        for child in list(r):
+            if child.tag == qn("w:t"):
+                group.append(child)
+                continue
 
-    # Put all text in the first node, clear the rest.
-    t_nodes[0].text = replaced
-    for t in t_nodes[1:]:
-        t.text = ""
-    return True
+            # Any boundary element ends the current text group.
+            if child.tag in boundary_tags:
+                if group:
+                    combined = "".join([(t.text or "") for t in group])
+                    replaced = repl_func(combined)
+                    if replaced != combined:
+                        group[0].text = replaced
+                        for t in group[1:]:
+                            t.text = ""
+                        changed = True
+                    group = []
+                continue
+
+            # Other elements: keep accumulating; they don't inherently break visible text flow.
+
+    # Flush any trailing group
+    if group:
+        combined = "".join([(t.text or "") for t in group])
+        replaced = repl_func(combined)
+        if replaced != combined:
+            group[0].text = replaced
+            for t in group[1:]:
+                t.text = ""
+            changed = True
+
+    return changed
 
 
 def _guess_default_course_line(doc: Document) -> Optional[str]:
@@ -555,24 +596,18 @@ def replace_cover_footer_text(doc: Document, course_name: str, unit_no: str) -> 
     def repl(text: str) -> str:
         out = text
 
-        # placeholders (case-insensitive)
+
+        # placeholders (case-insensitive; tolerate multiple / NBSP spaces)
         if course_name:
-            out = re.sub(r"(?i)\bcourse name\b", course_name, out)
+            out = re.sub(r"(?i)\bcourse[\s\u00A0]*name\b", course_name, out)
         if unit_no:
-            out = re.sub(r"(?i)\bunit no\b", unit_no, out)
+            out = re.sub(r"(?i)\bunit[\s\u00A0]*no\b", unit_no, out)
 
         # unit summary line
         if unit_title:
             out = re.sub(r"(?i)\bunit\s*\d+\s*-\s*summary\b", unit_title, out)
             # also handle en dash
             out = re.sub(r"(?i)\bunit\s*\d+\s*–\s*summary\b", unit_title, out)
-
-        # Heuristic: if a paragraph looks like the template's course line (often in footer/header),
-        # replace the whole line with the provided course name.
-        if course_name:
-            low = out.lower()
-            if (("diploma" in low) or ("certificate" in low) or ("qualification" in low)) and ("rqf" in low):
-                out = course_name
 
         # best-effort replacement of template's default title (exact match, if present)
         if course_name and default_course_line and default_course_line != course_name:
