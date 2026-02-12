@@ -12,6 +12,13 @@ generate_study_guide.py
   - 'unit no'      -> Unit No
   - 'Unit <n> - Summary' -> 'Unit {Unit No} - Summary' (if present)
 
+Fixes included in this version:
+- Footer: single-line layout (left / centre / right) and mirrored odd/even pages without wrapping
+- Safe handling for templates that have no body paragraphs (content in shapes/textboxes)
+- Safe handling for templates that don't initialise even-page footers
+- GUI shows full traceback in error popup (so future issues are diagnosable instantly)
+- Page breaks: each Questions block starts on a new page; Key Summary Statements starts on a new page
+
 Requirements:
   pip install python-docx openai
 Optional for PDF export via Word:
@@ -33,7 +40,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_BREAK
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn as qn2
 from docx.oxml.ns import qn
 from docx.opc.constants import CONTENT_TYPE as CT
 
@@ -47,6 +59,8 @@ DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")  # UI will not sh
 # If False, the course name + "Unit X - Summary" will NOT be repeated at the top of page 2.
 INCLUDE_PAGE2_COURSE_HEADER = False
 
+# Footer brand text (the "impe..." you mentioned). Change this to your exact footer left/right text.
+DEFAULT_BRAND_TEXT = "impe..."
 
 
 # ----------------------------
@@ -81,6 +95,7 @@ def extract_docx_text(docx_path: Path) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+
 def collect_word_files(inputs: List[Path], template: Path) -> List[Path]:
     """Collect .docx/.docm files from a list of files and/or folders."""
     word_files: List[Path] = []
@@ -100,8 +115,6 @@ def collect_word_files(inputs: List[Path], template: Path) -> List[Path]:
 
     # De-duplicate and sort
     return sorted({p for p in word_files})
-
-
 
 
 # ----------------------------
@@ -204,6 +217,8 @@ def parse_study_guide_json(raw: str) -> StudyGuideJSON:
         items = data.get(key, [])
         out: List[Tuple[str, List[str]]] = []
         for it in items:
+            if not isinstance(it, dict):
+                continue
             q = str(it.get("question", "")).strip()
             a = it.get("answer", [])
             if isinstance(a, str):
@@ -287,9 +302,7 @@ def _deepcopy_elm(elm):
 
 
 def apply_paragraph_format_from_proto(dst_p, proto_p):
-    """
-    Copy paragraph properties (including numbering/bullets) + style from proto_p onto dst_p.
-    """
+    """Copy paragraph properties (including numbering/bullets) + style from proto_p onto dst_p."""
     dst = dst_p._p
     proto = proto_p._p
 
@@ -307,9 +320,7 @@ def apply_paragraph_format_from_proto(dst_p, proto_p):
 
 
 def apply_run_format_from_proto(dst_run, proto_run):
-    """
-    Copy run properties (font, bold, etc.) from proto_run to dst_run.
-    """
+    """Copy run properties (font, bold, etc.) from proto_run to dst_run."""
     dst_r = dst_run._r
     proto_r = proto_run._r
     if proto_r.rPr is None:
@@ -319,7 +330,8 @@ def apply_run_format_from_proto(dst_run, proto_run):
     dst_r.insert(0, _deepcopy_elm(proto_r.rPr))
 
 
-def add_paragraph_from_proto(doc: Document, proto_p, text: str) -> None:
+def add_paragraph_from_proto(doc: Document, proto_p, text: str):
+    """Add a paragraph styled like proto_p and return the created paragraph."""
     p = doc.add_paragraph()
     apply_paragraph_format_from_proto(p, proto_p)
 
@@ -333,6 +345,7 @@ def add_paragraph_from_proto(doc: Document, proto_p, text: str) -> None:
     run = p.add_run(text)
     if proto_p.runs:
         apply_run_format_from_proto(run, proto_p.runs[0])
+    return p
 
 
 def _has_numpr(p) -> bool:
@@ -371,13 +384,15 @@ class TemplatePrototypes:
 
 def find_template_prototypes(doc: Document) -> TemplatePrototypes:
     """
-    Try to discover paragraphs inside the template that already have the exact formatting
-    (including bullets/numbering) that we want to reuse.
-
-    Works with templates that include sample content (recommended).
-    Falls back to reasonable defaults if some items can't be found.
+    Discover paragraphs in the template that have the formatting we want to reuse.
+    Safe for templates that have no body paragraphs (content in shapes/textboxes).
     """
     paras = doc.paragraphs
+
+    # SAFETY: some templates have no body paragraphs at all.
+    if not paras:
+        doc.add_paragraph("")
+        paras = doc.paragraphs
 
     # Heading: first bold non-list paragraph with text
     heading = next(
@@ -402,7 +417,7 @@ def find_template_prototypes(doc: Document) -> TemplatePrototypes:
     # Answer: paragraph starting with "Answer:"
     answer = next((p for p in paras if p.text.strip().lower().startswith("answer:")), None)
     if answer is None:
-        answer = body or label or heading or paras[-1]
+        answer = body or label or heading or paras[0]
 
     # Key heading: "Key Summary Statements"
     key_heading = next((p for p in paras if p.text.strip().lower() == "key summary statements"), None)
@@ -428,7 +443,6 @@ def find_template_prototypes(doc: Document) -> TemplatePrototypes:
     practice_question = q_proto_by_num[q_num_ids[1]] if len(q_num_ids) > 1 else quiz_question
 
     # Key point bullets: numPr paragraph that is NOT a question and not answer
-    # Prefer one after key heading
     key_point = None
     if key_heading is not None:
         try:
@@ -445,11 +459,11 @@ def find_template_prototypes(doc: Document) -> TemplatePrototypes:
             None
         )
 
-    # Spacer: first empty paragraph (use it to keep spacing consistent)
+    # Spacer: first empty paragraph
     spacer = next((p for p in paras if not p.text.strip()), None)
 
     # Robust fallbacks
-    fallback = next((p for p in paras if p.text is not None), paras[0])
+    fallback = paras[0]
     heading = heading or fallback
     body = body or heading or fallback
     label = label or heading or fallback
@@ -480,10 +494,7 @@ _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
 def _iter_docx_text_parts(doc: Document):
-    """
-    Yield the main document + all header/footer parts so we can replace text everywhere,
-    including textboxes (w:txbxContent) and footers.
-    """
+    """Yield main doc + all header/footer parts (so we can replace text everywhere)."""
     pkg = doc.part.package
     for part in pkg.parts:
         if part.content_type in (CT.WML_DOCUMENT_MAIN, CT.WML_HEADER, CT.WML_FOOTER):
@@ -498,15 +509,7 @@ def _replace_in_w_p(w_p, repl_func) -> bool:
     """
     Replace text inside a single Word paragraph element (w:p) while preserving layout-critical
     elements such as tabs and fields.
-
-    Word footers/headers often lay out "left / center / right" content using w:tab and field codes
-    (e.g., page numbers). The previous implementation rebuilt the whole paragraph text from all w:t
-    nodes and then shoved it back into the first node, which can break tab stops and fields.
-
-    This version replaces text ONLY within contiguous groups of w:t nodes that are separated by
-    boundary elements (w:tab, field code markers, line breaks, etc.).
     """
-    # Boundary tags inside a run that we should NOT cross when doing replacements
     boundary_tags = {
         qn("w:tab"),
         qn("w:br"),
@@ -520,7 +523,6 @@ def _replace_in_w_p(w_p, repl_func) -> bool:
     changed = False
     group = []
 
-    # Iterate runs in document order; inside each run, iterate children to detect boundaries.
     runs = w_p.xpath(".//w:r")
     for r in runs:
         for child in list(r):
@@ -528,7 +530,6 @@ def _replace_in_w_p(w_p, repl_func) -> bool:
                 group.append(child)
                 continue
 
-            # Any boundary element ends the current text group.
             if child.tag in boundary_tags:
                 if group:
                     combined = "".join([(t.text or "") for t in group])
@@ -541,9 +542,6 @@ def _replace_in_w_p(w_p, repl_func) -> bool:
                     group = []
                 continue
 
-            # Other elements: keep accumulating; they don't inherently break visible text flow.
-
-    # Flush any trailing group
     if group:
         combined = "".join([(t.text or "") for t in group])
         replaced = repl_func(combined)
@@ -557,10 +555,7 @@ def _replace_in_w_p(w_p, repl_func) -> bool:
 
 
 def _guess_default_course_line(doc: Document) -> Optional[str]:
-    """
-    Best-effort: pick the longest paragraph text that looks like a course title
-    (useful when the template doesn't contain the literal placeholder 'course name').
-    """
+    """Best-effort: choose the longest line that looks like a course title."""
     candidates: List[str] = []
     for part in _iter_docx_text_parts(doc):
         root = part._element
@@ -581,11 +576,10 @@ def _guess_default_course_line(doc: Document) -> Optional[str]:
 
 def replace_cover_footer_text(doc: Document, course_name: str, unit_no: str) -> None:
     """
-    Replaces placeholders in cover/footer/header/main document XML:
+    Replaces placeholders in cover/footer/header/main doc XML:
       - 'course name' -> course_name
       - 'unit no' -> unit_no
       - 'Unit <n> - Summary' -> 'Unit {unit_no} - Summary'
-    Also tries to replace a detected "default course title" line from the template, if present.
     """
     course_name = course_name.strip()
     unit_no = unit_no.strip()
@@ -595,21 +589,15 @@ def replace_cover_footer_text(doc: Document, course_name: str, unit_no: str) -> 
 
     def repl(text: str) -> str:
         out = text
-
-
-        # placeholders (case-insensitive; tolerate multiple / NBSP spaces)
         if course_name:
             out = re.sub(r"(?i)\bcourse[\s\u00A0]*name\b", course_name, out)
         if unit_no:
             out = re.sub(r"(?i)\bunit[\s\u00A0]*no\b", unit_no, out)
 
-        # unit summary line
         if unit_title:
             out = re.sub(r"(?i)\bunit\s*\d+\s*-\s*summary\b", unit_title, out)
-            # also handle en dash
             out = re.sub(r"(?i)\bunit\s*\d+\s*–\s*summary\b", unit_title, out)
 
-        # best-effort replacement of template's default title (exact match, if present)
         if course_name and default_course_line and default_course_line != course_name:
             out = out.replace(default_course_line, course_name)
 
@@ -620,6 +608,165 @@ def replace_cover_footer_text(doc: Document, course_name: str, unit_no: str) -> 
         for w_p in root.xpath(".//w:p"):
             _replace_in_w_p(w_p, repl)
 
+
+# ----------------------------
+# Footer layout helpers (odd/even, 1-line left/center/right)
+# ----------------------------
+
+def _clear_footer(footer) -> None:
+    """Remove all paragraphs from a footer, leaving one empty paragraph."""
+    if not footer.paragraphs:
+        footer.add_paragraph("")
+
+    for p in list(footer.paragraphs)[1:]:
+        try:
+            p._element.getparent().remove(p._element)
+        except Exception:
+            pass
+
+    p0 = footer.paragraphs[0]
+    for r in list(p0.runs):
+        try:
+            p0._p.remove(r._r)
+        except Exception:
+            pass
+    p0.text = ""
+
+
+def _set_para_tabstops_lr_center(p, section) -> None:
+    """
+    Tab stops for a single footer line:
+      left: implicit at 0
+      centre: usable_width/2
+      right: usable_width
+    """
+    usable = section.page_width - section.left_margin - section.right_margin
+    center_twips = int(usable.twips / 2)
+    right_twips = int(usable.twips)
+
+    pPr = p._p.get_or_add_pPr()
+
+    tabs = pPr.find(qn2("w:tabs"))
+    if tabs is not None:
+        pPr.remove(tabs)
+
+    tabs = OxmlElement("w:tabs")
+
+    def _add_tab(val: str, pos_twips: int):
+        t = OxmlElement("w:tab")
+        t.set(qn2("w:val"), val)   # 'center' or 'right'
+        t.set(qn2("w:pos"), str(pos_twips))
+        tabs.append(t)
+
+    _add_tab("center", center_twips)
+    _add_tab("right", right_twips)
+    pPr.append(tabs)
+
+
+def _append_page_field_run(p, size_pt: int = 8) -> None:
+    """Append a PAGE field to paragraph p (Word will update it).
+
+    We set the run font size so the page number matches the rest of the footer.
+    """
+    fld = OxmlElement("w:fldSimple")
+    fld.set(qn2("w:instr"), r" PAGE \* MERGEFORMAT " )
+
+    r = OxmlElement("w:r")
+    # rPr -> font size (Word uses half-points)
+    rPr = OxmlElement("w:rPr")
+    sz = OxmlElement("w:sz")
+    sz.set(qn2("w:val"), str(int(size_pt) * 2))
+    szCs = OxmlElement("w:szCs")
+    szCs.set(qn2("w:val"), str(int(size_pt) * 2))
+    rPr.append(sz)
+    rPr.append(szCs)
+    r.append(rPr)
+
+    t = OxmlElement("w:t")
+    t.text = "1"
+    r.append(t)
+    fld.append(r)
+    p._p.append(fld)
+
+
+def set_mirrored_footer_line(doc: Document, course_name: str, brand_text: str, font_size_pt: int = 8) -> None:
+    """
+    1-line footer with:
+      - Centre: course_name
+      - Odd pages: left=brand_text, right=page number
+      - Even pages: left=page number, right=brand_text
+
+    Uses tabs + explicit tab stops, and forces font size to prevent wrapping.
+    """
+    try:
+        sec = doc.sections[0]
+    except Exception:
+        return
+
+    course_name = re.sub(r"\s+", " ", (course_name or "").strip())
+    brand_text = re.sub(r"\s+", " ", (brand_text or "").strip())
+
+    # Enable odd/even variation
+    try:
+        sec.different_odd_and_even_pages_header_footer = True
+    except Exception:
+        pass
+
+    def _style_footer_paragraph(p):
+        try:
+            pf = p.paragraph_format
+            pf.space_before = 0
+            pf.space_after = 0
+            pf.line_spacing = 1
+        except Exception:
+            pass
+
+    def _run(txt: str, para):
+        r = para.add_run(txt)
+        try:
+            r.font.size = Pt(int(font_size_pt))
+        except Exception:
+            pass
+        return r
+
+    # ODD footer
+    try:
+        odd = sec.footer
+        _clear_footer(odd)
+        p = odd.paragraphs[0]
+        _style_footer_paragraph(p)
+        _set_para_tabstops_lr_center(p, sec)
+
+        _run(brand_text, p)
+        _run("\t", p)
+        _run(course_name, p)
+        _run("\t", p)
+        _append_page_field_run(p, size_pt=int(font_size_pt))
+    except Exception:
+        pass
+
+    # EVEN footer
+    try:
+        even = sec.even_page_footer
+        _clear_footer(even)
+        p2 = even.paragraphs[0]
+        _style_footer_paragraph(p2)
+        _set_para_tabstops_lr_center(p2, sec)
+
+        _append_page_field_run(p2, size_pt=int(font_size_pt))
+        _run("\t", p2)
+        _run(course_name, p2)
+        _run("\t", p2)
+        _run(brand_text, p2)
+    except Exception:
+        pass
+
+
+def add_page_break_paragraph(doc: Document) -> None:
+    """Insert a page break as its own paragraph."""
+    p = doc.add_paragraph()
+    run = p.add_run("")
+    run.add_break(WD_BREAK.PAGE)
 
 
 # ----------------------------
@@ -639,16 +786,13 @@ def _load_image_bytes_converted(image_path: Path, target_content_type: str) -> b
     elif target == "image/png":
         target_fmt = "PNG"
     else:
-        # Unknown type; just return bytes as-is
         return raw
 
-    # Quick header check: if already matches, return as-is
     if target_fmt == "JPEG" and raw[:2] == b"\xff\xd8":
         return raw
     if target_fmt == "PNG" and raw[:8] == b"\x89PNG\r\n\x1a\n":
         return raw
 
-    # Convert using Pillow if available
     try:
         from PIL import Image  # type: ignore
         import io
@@ -660,10 +804,8 @@ def _load_image_bytes_converted(image_path: Path, target_content_type: str) -> b
         )
 
     with Image.open(image_path) as im:
-        # Ensure compatible mode
         if target_fmt == "JPEG":
             if im.mode in ("RGBA", "LA"):
-                # drop alpha
                 bg = Image.new("RGB", im.size, (255, 255, 255))
                 bg.paste(im, mask=im.split()[-1])
                 im = bg
@@ -685,7 +827,6 @@ def replace_cover_image(doc: Document, cover_image_path: Path) -> None:
     """
     Replace the template cover image with the user-selected image.
     Strategy: find the largest embedded image part in the DOCX package and replace its blob.
-    This preserves the layout (size/crop/position) from the template.
     """
     if not cover_image_path:
         return
@@ -698,12 +839,10 @@ def replace_cover_image(doc: Document, cover_image_path: Path) -> None:
     if not img_parts:
         raise SystemExit("Template contains no embedded images to replace (cover image not found).")
 
-    # Pick the largest embedded image (usually the cover)
     target_part = max(img_parts, key=lambda p: len(getattr(p, "blob", b"") or b""))
     new_bytes = _load_image_bytes_converted(cover_image_path, getattr(target_part, "content_type", ""))
-
-    # Replace the image bytes
     target_part._blob = new_bytes
+
 
 # ----------------------------
 # Study guide DOCX writer
@@ -716,10 +855,10 @@ def write_study_guide_docx(
     unit_no: str,
     sg: StudyGuideJSON,
     cover_image_path: Optional[Path] = None,
+    brand_text: str = DEFAULT_BRAND_TEXT,
 ):
     doc = Document(str(template_path))
 
-    # Optional: replace the cover image in the template
     if cover_image_path:
         replace_cover_image(doc, cover_image_path)
 
@@ -730,8 +869,12 @@ def write_study_guide_docx(
     if course_name.strip() or unit_no.strip():
         replace_cover_footer_text(doc, course_name=course_name, unit_no=unit_no)
 
+    # Footer: mirrored 1-line layout (odd/even) with course name centred
+    set_mirrored_footer_line(doc, course_name=course_name, brand_text=brand_text)
+
     # Remove sample body (keep cover page shapes etc.)
     clear_body_from_first_content(doc)
+
     # Optional: avoid repeating the cover-page title on page 2.
     if INCLUDE_PAGE2_COURSE_HEADER:
         if course_name.strip():
@@ -739,12 +882,17 @@ def write_study_guide_docx(
         if unit_no.strip():
             add_paragraph_from_proto(doc, protos.heading, f"Unit {unit_no.strip()} - Summary")
         add_paragraph_from_proto(doc, protos.spacer, "")
-    # Section 1
-    add_paragraph_from_proto(doc, protos.heading, sg.section1_heading)
+
+    # Section 1 (topic) — each topic heading must start on a new page
+    p_h1 = add_paragraph_from_proto(doc, protos.heading, sg.section1_heading)
+    try:
+        p_h1.paragraph_format.page_break_before = True
+    except Exception:
+        pass
     add_paragraph_from_proto(doc, protos.body, sg.section1_paragraph)
     add_paragraph_from_proto(doc, protos.spacer, "")
 
-    # Quiz questions
+    # Quiz questions — can flow on the same page; Word will move content if space runs out
     add_paragraph_from_proto(doc, protos.label, "Questions:")
     add_paragraph_from_proto(doc, protos.spacer, "")
     for q, a in sg.quiz:
@@ -753,12 +901,16 @@ def write_study_guide_docx(
         add_paragraph_from_proto(doc, protos.answer, f"Answer: {joined}")
     add_paragraph_from_proto(doc, protos.spacer, "")
 
-    # Section 2
-    add_paragraph_from_proto(doc, protos.heading, sg.section2_heading)
+    # Section 2 (topic) — new page
+    p_h2 = add_paragraph_from_proto(doc, protos.heading, sg.section2_heading)
+    try:
+        p_h2.paragraph_format.page_break_before = True
+    except Exception:
+        pass
     add_paragraph_from_proto(doc, protos.body, sg.section2_paragraph)
     add_paragraph_from_proto(doc, protos.spacer, "")
 
-    # Practice questions
+    # Practice questions — can flow on the same page
     add_paragraph_from_proto(doc, protos.label, "Questions:")
     add_paragraph_from_proto(doc, protos.spacer, "")
     for q, a in sg.practice:
@@ -767,8 +919,12 @@ def write_study_guide_docx(
         add_paragraph_from_proto(doc, protos.answer, f"Answer: {joined}")
     add_paragraph_from_proto(doc, protos.spacer, "")
 
-    # Key points
-    add_paragraph_from_proto(doc, protos.key_heading, "Key Summary Statements")
+    # Key Summary Statements — must start on a new page
+    p_key = add_paragraph_from_proto(doc, protos.key_heading, "Key Summary Statements")
+    try:
+        p_key.paragraph_format.page_break_before = True
+    except Exception:
+        pass
     add_paragraph_from_proto(doc, protos.spacer, "")
     for s in sg.key_points:
         add_paragraph_from_proto(doc, protos.key_point, s)
@@ -829,6 +985,7 @@ def run_generation(
     retry_on_invalid: bool,
     cover_image: Optional[Path] = None,
     model: str = DEFAULT_MODEL,
+    brand_text: str = DEFAULT_BRAND_TEXT,
 ):
     word_files = collect_word_files(inputs, template)
 
@@ -890,6 +1047,7 @@ Return STRICT JSON ONLY.
         unit_no=unit_no,
         sg=sg,
         cover_image_path=cover_image,
+        brand_text=brand_text,
     )
 
     if out_pdf:
@@ -905,6 +1063,7 @@ def run_gui():
     from tkinter import filedialog, messagebox
     from tkinter import ttk
     import threading
+    import traceback
 
     root = tk.Tk()
     root.title("Study Guide Generator")
@@ -1107,13 +1266,11 @@ def run_gui():
             messagebox.showerror("Missing input", "Please enter a numeric Unit no (e.g., 10).")
             return
 
-        # Cover image (optional)
         cover_image_raw = cover_image_var.get().strip()
         cover_image_path = Path(cover_image_raw) if cover_image_raw else None
         if cover_image_path and not cover_image_path.exists():
             messagebox.showerror("Missing input", f"Cover image not found: {cover_image_path}")
             return
-
 
         out_docx = out_dir / f"{base}.docx"
         out_pdf = (out_dir / f"{base}.pdf") if make_pdf_var.get() else None
@@ -1137,13 +1294,14 @@ def run_gui():
                     retry_on_overlimit=retry_over_var.get(),
                     retry_on_invalid=retry_invalid_var.get(),
                     model=DEFAULT_MODEL,
+                    brand_text=DEFAULT_BRAND_TEXT,
                 )
 
                 status_var.set(f"Done. Saved: {out_docx.name}" + (f" and {out_pdf.name}" if out_pdf else ""))
                 messagebox.showinfo("Success", f"Created:\n{out_docx}\n" + (f"{out_pdf}" if out_pdf else ""))
-            except Exception as e:
+            except Exception:
                 status_var.set("Error.")
-                messagebox.showerror("Error", str(e))
+                messagebox.showerror("Error", traceback.format_exc())
             finally:
                 generate_btn.config(state="normal")
 
@@ -1166,14 +1324,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument("--out-docx", type=Path, help="Output .docx path.")
     ap.add_argument("--out-pdf", type=Path, default=None, help="Optional output .pdf path.")
 
-    # New (preferred)
     ap.add_argument("--course-name", type=str, default="")
     ap.add_argument("--unit-no", type=str, default="")
 
-    # Back-compat (optional)
     ap.add_argument("--course-title", type=str, default="")
     ap.add_argument("--unit-title", type=str, default="")
-    ap.add_argument("--cover-image", type=Path, default=None, help="Optional cover image (PNG/JPG) to replace the template cover image.")
+    ap.add_argument("--cover-image", type=Path, default=None, help="Optional cover image (PNG/JPG).")
 
     ap.add_argument("--word-limit", choices=["auto", "750", "1000"], default="auto")
     ap.add_argument("--auto-threshold", type=int, default=3)
@@ -1195,11 +1351,9 @@ def main():
     if missing:
         raise SystemExit(f"Missing required CLI args: {missing}. Or run with --gui.")
 
-    # Resolve course/unit
     course_name = (args.course_name or args.course_title or "").strip()
     unit_no = (args.unit_no or "").strip()
 
-    # If unit_no missing but unit_title provided, try to parse e.g. "Unit 10 - Summary"
     if not unit_no and args.unit_title:
         m = re.search(r"\bunit\s*(\d+)\b", args.unit_title, flags=re.IGNORECASE)
         if m:
@@ -1208,7 +1362,7 @@ def main():
     if not course_name:
         raise SystemExit("Missing --course-name (or --course-title).")
     if not unit_no:
-        raise SystemExit("Missing --unit-no (or provide a parsable --unit-title like 'Unit 10 - Summary').")
+        raise SystemExit("Missing --unit-no (or provide parsable --unit-title like 'Unit 10 - Summary').")
 
     run_generation(
         inputs=[args.docx_dir],
@@ -1224,6 +1378,7 @@ def main():
         retry_on_overlimit=args.retry_on_overlimit,
         retry_on_invalid=args.retry_on_invalid,
         model=DEFAULT_MODEL,
+        brand_text=DEFAULT_BRAND_TEXT,
     )
 
     print(f"Created: {args.out_docx}")
