@@ -706,6 +706,10 @@ def set_mirrored_footer_line(doc: Document, course_name: str, brand_text: str, f
     course_name = re.sub(r"\s+", " ", (course_name or "").strip())
     brand_text = re.sub(r"\s+", " ", (brand_text or "").strip())
 
+    # Prevent Word from wrapping the centre text onto a new line by using
+    # non-breaking spaces/hyphens in the footer only.
+    course_name_footer = course_name.replace(" ", "\u00A0").replace("-", "\u2011")
+
     # Enable odd/even variation
     try:
         sec.different_odd_and_even_pages_header_footer = True
@@ -718,6 +722,11 @@ def set_mirrored_footer_line(doc: Document, course_name: str, brand_text: str, f
             pf.space_before = 0
             pf.space_after = 0
             pf.line_spacing = 1
+            # Critical: remove indentation inherited from footer styles.
+            # Indents shift tab stops and can cause the footer to wrap onto 2 lines.
+            pf.left_indent = Pt(0)
+            pf.right_indent = Pt(0)
+            pf.first_line_indent = Pt(0)
         except Exception:
             pass
 
@@ -739,7 +748,7 @@ def set_mirrored_footer_line(doc: Document, course_name: str, brand_text: str, f
 
         _run(brand_text, p)
         _run("\t", p)
-        _run(course_name, p)
+        _run(course_name_footer, p)
         _run("\t", p)
         _append_page_field_run(p, size_pt=int(font_size_pt))
     except Exception:
@@ -755,7 +764,7 @@ def set_mirrored_footer_line(doc: Document, course_name: str, brand_text: str, f
 
         _append_page_field_run(p2, size_pt=int(font_size_pt))
         _run("\t", p2)
-        _run(course_name, p2)
+        _run(course_name_footer, p2)
         _run("\t", p2)
         _run(brand_text, p2)
     except Exception:
@@ -1142,8 +1151,8 @@ def run_gui():
 
     header = ttk.Label(
         main,
-        text="Generate a Study Guide from a folder of Word documents (.docx), outputting to your Word template.",
-        font=("Segoe UI", 11, "bold")
+        text="Study Guide Generator",
+        font=("Segoe UI", 12, "bold")
     )
     header.grid(row=0, column=0, sticky="w", pady=(0, 10))
 
@@ -1198,9 +1207,8 @@ def run_gui():
 
     checks = ttk.Frame(opts)
     checks.grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 8))
+    # Keep the UI simple: only show PDF export.
     ttk.Checkbutton(checks, text="Export PDF", variable=make_pdf_var).grid(row=0, column=0, padx=(0, 14))
-    ttk.Checkbutton(checks, text="Retry if over word limit", variable=retry_over_var).grid(row=0, column=1, padx=(0, 14))
-    ttk.Checkbutton(checks, text="Retry if JSON invalid", variable=retry_invalid_var).grid(row=0, column=2, padx=(0, 14))
 
     adv = ttk.Frame(opts)
     adv.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -1217,12 +1225,7 @@ def run_gui():
     generate_btn = ttk.Button(footer, text="Generate study guide")
     generate_btn.grid(row=0, column=1, sticky="e")
 
-    hint = ttk.Label(
-        main,
-        text="API key: set OPENAI_API_KEY   (Model is fixed internally)",
-        foreground="#666"
-    )
-    hint.grid(row=5, column=0, sticky="w", pady=(8, 0))
+    # No API-key hint shown in the UI (keeps the window clean for end users).
 
     def do_generate():
         raw_inputs = docx_dir_var.get().strip()
